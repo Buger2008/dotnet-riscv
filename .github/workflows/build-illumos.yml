@@ -42,14 +42,19 @@ jobs:
         echo "==> disk"
         df -h
 
-    - name: Maximize build space
-      uses: AdityaGarg8/remove-unwanted-software@v4.1
-      with:
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-        remove-codeql: 'true'
-        remove-cached-tools: 'true'
+    # The runner ships ~87G free, which has proved sufficient, so nothing is deleted
+    # any more (the previous remove-unwanted-software step only freed ~25G and cost
+    # ~1.5 min). Just report the free space and warn early if it looks tight, instead
+    # of discovering ENOSPC two hours into the build.
+    - name: Check disk space (no cleanup)
+      run: |
+        echo "==> free space before build (nothing is deleted)"
+        df -h
+        avail=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')
+        echo "==> free on / : ${avail}G"
+        if [ "${avail:-0}" -lt 40 ]; then
+          echo "::warning title=Low disk space::only ${avail}G free on / - the build may hit ENOSPC"
+        fi
 
     - name: Clone repository
       run: |
@@ -90,7 +95,7 @@ jobs:
               # directory (<exec-prefix>/<target>/bin/ld), so a linker installed
               # into the PATH is not enough: the build inherits -fuse-ld=lld from
               # the clang-based compiler setup and then dies with
-              # "collect2: fatal error: cannot find 'ld'".
+              # "collect2: fatal error: cannot find ld".
               # Probe the actual link, then force the bfd (GNU ld) linker, which is
               # the one this toolchain actually ships.
               CROSS_BIN=/crossrootfs/x64/bin
@@ -140,7 +145,7 @@ jobs:
               # GCC 13 produces false positives that -Werror turns into hard failures:
               #   vm/common.h:181  ... reading 16 bytes from a region of size 0
               #                        [-Werror=stringop-overread]
-              #   jit/gentree.cpp  ... 'this' pointer is null [-Werror=nonnull]
+              #   jit/gentree.cpp  ... this pointer is null [-Werror=nonnull]
               # -Werror only exists because prerelease builds enable it
               # (configurecompiler.cmake: "if (PRERELEASE) add_compile_options(-Werror)"),
               # and its suppression list already covers the sibling warnings. Patch that
@@ -180,9 +185,11 @@ jobs:
               fi
               # ASP.NET Core tool projects are published per RID, but their assets file is
               # restored without the target RID, so the publish step fails with NETSDK1047
-              # ("assets file ... doesn't have a target for net11.0/<rid>"). Append the
-              # target RID to RuntimeIdentifiers. Written without single quotes on purpose:
-              # the whole script sits inside bash -c '...'.
+              # ("assets file ... does not have a target for net11.0/<rid>"). Append the
+              # target RID to RuntimeIdentifiers.
+              # NOTE: this script is the argument of bash -c, so a single quote is not
+              # allowed anywhere inside it - an apostrophe in a comment truncates the
+              # command (that is what broke the previous run).
               for proj in /dotnet/src/aspnetcore/src/Tools/dotnet-dev-certs/src/dotnet-dev-certs.csproj \
                           /dotnet/src/aspnetcore/src/Tools/dotnet-user-jwts/src/dotnet-user-jwts.csproj \
                           /dotnet/src/aspnetcore/src/Tools/dotnet-user-secrets/src/dotnet-user-secrets.csproj; do
