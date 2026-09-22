@@ -51,30 +51,64 @@ jobs:
           mcr.microsoft.com/dotnet-buildtools/prereqs:${{ matrix.docker_tag }} \
             bash -c '
               set -e
-              # The runtime build defaults to ninja (eng/native/build-commons.sh sets
-              # __UseNinja=1) and hard-fails with "Unable to locate ninja!", but the
-              # prereqs image ships no ninja. Install it before building.
-              if ! command -v ninja >/dev/null 2>&1; then
-                export DEBIAN_FRONTEND=noninteractive
-                # The image references apt.kitware.com but its signing key is not in the
-                # keyring, which makes a plain "apt-get update" abort with exit code 100.
-                # Drop that source; ninja-build comes from the Ubuntu archive.
-                for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
-                  [ -f "$f" ] || continue
-                  grep -q apt.kitware.com "$f" || continue
-                  if [ "$f" = /etc/apt/sources.list ]; then
-                    sed -i "/apt.kitware.com/d" "$f"
-                  else
-                    rm -f "$f"
-                  fi
-                done
-                apt-get update -o Acquire::AllowInsecureRepositories=true
-                apt-get install -y --no-install-recommends ninja-build || true
-                # Fallback in case ninja-build is not in the enabled components.
-                command -v ninja >/dev/null 2>&1 || python3 -m pip install --no-cache-dir --quiet ninja || true
-                command -v ninja >/dev/null 2>&1 || { echo "==> unable to install ninja"; exit 1; }
-              fi
-              echo "==> ninja: $(ninja --version)"
+              export DEBIAN_FRONTEND=noninteractive
+              # The image references apt.kitware.com but its signing key is not in the
+              # keyring, which makes a plain "apt-get update" abort with exit code 100.
+              # Drop that source; cmake is already installed so nothing needs it.
+              for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+                [ -f "$f" ] || continue
+                grep -q apt.kitware.com "$f" || continue
+                if [ "$f" = /etc/apt/sources.list ]; then
+                  sed -i "/apt.kitware.com/d" "$f"
+                else
+                  rm -f "$f"
+                fi
+              done
+              apt-get update -o Acquire::AllowInsecureRepositories=true
+              # ninja: the runtime build defaults to ninja (__UseNinja=1 in
+              # eng/native/build-commons.sh) and hard-fails with "Unable to locate
+              # ninja!" when it is missing.
+              # lld: the build passes -fuse-ld=lld to the illumos cross gcc, but the
+              # image ships no lld at all.
+              apt-get install -y --no-install-recommends ninja-build lld || true
+              command -v ninja >/dev/null 2>&1 || python3 -m pip install --no-cache-dir --quiet ninja || true
+              command -v ninja >/dev/null 2>&1 || { echo "==> unable to install ninja"; exit 1; }
+              echo "==> ninja: $(command -v ninja) $(ninja --version)"
+              echo "==> lld: $(command -v ld.lld || command -v lld || echo MISSING)"
+
+              # The crossrootfs only ships the x86_64-illumos- prefixed linker names
+              # (x86_64-illumos-ld), while the cross gcc looks for the name reported
+              # below. The gcc always prefixes it, so an alias can never shadow the
+              # host linker used by the host parts of the build.
+              CROSS_BIN=/crossrootfs/x64/bin
+              CROSS_CC=$CROSS_BIN/x86_64-illumos-gcc
+              for prog in ld ld.bfd; do
+                want=$("$CROSS_CC" -print-prog-name="$prog" 2>/dev/null || true)
+                echo "==> gcc -print-prog-name=$prog -> ${want:-<empty>}"
+                case "$want" in
+                  /*) [ -e "$want" ] || ln -sf "$CROSS_BIN/x86_64-illumos-$prog" "$want" ;;
+                  ""|"$prog") : ;;
+                  *)
+                    for dir in "$CROSS_BIN" /usr/local/bin; do
+                      [ -e "$dir/$want" ] || ln -sf "$CROSS_BIN/x86_64-illumos-$prog" "$dir/$want"
+                    done
+                    ;;
+                esac
+              done
+
+              # Link a trivial program the same way CMake will, and report which
+              # linker each candidate resolves to, so any failure is diagnosable
+              # from this log without another round trip.
+              printf "int main(void){return 0;}\n" > /tmp/probe.c
+              for cand in "" "-fuse-ld=lld" "-fuse-ld=bfd"; do
+                if "$CROSS_CC" --sysroot=/crossrootfs/x64 $cand /tmp/probe.c -o /tmp/probe -lssp >/dev/null 2>/tmp/probe.err; then
+                  used=$("$CROSS_CC" -v --sysroot=/crossrootfs/x64 $cand /tmp/probe.c -o /tmp/probe -lssp 2>&1 | grep -o "/[^ ]*ld[.a-z0-9-]*" | tail -1 || true)
+                  echo "==> cross link OK    : ${cand:-<compiler default>} (linker: ${used:-unknown})"
+                else
+                  echo "==> cross link FAILED: ${cand:-<compiler default>}"
+                  sed -n "1,4p" /tmp/probe.err
+                fi
+              done
               exec "$@"
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
