@@ -100,23 +100,33 @@ jobs:
                 fi
               done
 
-              # EXTRA_LDFLAGS is appended after the inherited LDFLAGS by
-              # eng/native/build-commons.sh, so it wins over the bogus -fuse-ld=lld.
-              if ! cross_link -fuse-ld=lld >/dev/null 2>&1 && cross_link -fuse-ld=bfd >/dev/null 2>&1; then
-                HOST_CC=$(command -v clang-18 || command -v clang || true)
-                if [ -z "$HOST_CC" ] || "$HOST_CC" -fuse-ld=bfd /tmp/probe.c -o /tmp/probe.host >/dev/null 2>&1; then
-                  export EXTRA_LDFLAGS="-fuse-ld=bfd"
-                  echo "==> forcing EXTRA_LDFLAGS=-fuse-ld=bfd"
-                else
-                  # The host clang rejects the flag, so make the requested lld name
-                  # resolvable where this cross gcc looks for its linker instead.
-                  TARGET_BIN=$(dirname "$("$CROSS_CC" -print-prog-name=ld 2>/dev/null || echo /crossrootfs/x64/x86_64-sun-solaris2.11/bin/ld)")
-                  mkdir -p "$TARGET_BIN"
-                  ln -sf "$(command -v ld.lld || echo /usr/bin/ld.lld)" "$TARGET_BIN/ld.lld"
-                  echo "==> host clang rejects -fuse-ld=bfd; aliased ld.lld into $TARGET_BIN"
-                fi
+              # EXTRA_LDFLAGS cannot be relied on here: the VMR runs each repo build
+              # in a sanitised child environment, so the variable never reaches
+              # eng/native/build-commons.sh. Instead make the requested linker name
+              # resolve where this cross gcc actually looks for it, and verify it by
+              # linking for real. TARGET_BIN is the compiler own tool directory.
+              TARGET_BIN=$(dirname "$("$CROSS_CC" -print-prog-name=ld 2>/dev/null || echo /crossrootfs/x64/x86_64-sun-solaris2.11/bin/ld)")
+              CROSS_LD=$TARGET_BIN/ld
+              if ! cross_link -fuse-ld=lld >/dev/null 2>&1; then
+                echo "==> -fuse-ld=lld has no linker of that name; aliasing the lld name to the toolchain GNU ld"
+                for p in "$TARGET_BIN/ld.lld" "$TARGET_BIN/x86_64-sun-solaris2.11-ld.lld" \
+                         "$CROSS_BIN/ld.lld" "$CROSS_BIN/x86_64-illumos-ld.lld"; do
+                  [ -e "$p" ] && continue
+                  mkdir -p "$(dirname "$p")"
+                  ln -sf "$CROSS_LD" "$p"
+                  echo "==> aliased $p -> $CROSS_LD"
+                  if cross_link -fuse-ld=lld >/dev/null 2>&1; then
+                    echo "==> -fuse-ld=lld now links"
+                    break
+                  fi
+                done
               fi
-              echo "==> EXTRA_LDFLAGS=${EXTRA_LDFLAGS:-<unset>}"
+              if cross_link -fuse-ld=lld >/dev/null 2>&1; then
+                echo "==> link check passed with -fuse-ld=lld"
+              else
+                echo "==> still cannot link with -fuse-ld=lld; failing fast"
+                exit 1
+              fi
               exec "$@"
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
