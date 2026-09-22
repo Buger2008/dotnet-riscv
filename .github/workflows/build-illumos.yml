@@ -127,6 +127,31 @@ jobs:
                 echo "==> still cannot link with -fuse-ld=lld; failing fast"
                 exit 1
               fi
+              # GCC 13 raises a false positive in src/coreclr/vm/common.h (the
+              # inlined memcpy in memcpyNoGCRefs) that -Werror turns into a hard
+              # failure: "error: reading 16 bytes from a region of size 0
+              # [-Werror=stringop-overread]". configurecompiler.cmake already
+              # suppresses the sibling warnings for GCC, so add this one there.
+              # Env vars (CFLAGS/EXTRA_*) cannot be used: the VMR runs the repo
+              # builds in a sanitised child environment.
+              CCF=/dotnet/src/runtime/eng/native/configurecompiler.cmake
+              if [ -f "$CCF" ] && ! grep -q stringop-overread "$CCF"; then
+                sed -i "s#COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>)#COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>)\n    add_compile_options(\$<\$<COMPILE_LANGUAGE:CXX>:-Wno-stringop-overread>)#" "$CCF"
+              fi
+              if grep -q stringop-overread "$CCF" 2>/dev/null; then
+                echo "==> suppressed: $(grep -n stringop-overread "$CCF" | tr "\n" " ")"
+              else
+                echo "==> could not patch configurecompiler.cmake; wrapping the cross compilers instead"
+                for comp in gcc g++; do
+                  real=/crossrootfs/x64/bin/x86_64-illumos-$comp-real
+                  if [ ! -e "$real" ]; then
+                    mv "/crossrootfs/x64/bin/x86_64-illumos-$comp" "$real"
+                    printf "%s\n" "#!/bin/sh" "exec $real -Wno-stringop-overread \"\$@\"" > "/crossrootfs/x64/bin/x86_64-illumos-$comp"
+                    chmod +x "/crossrootfs/x64/bin/x86_64-illumos-$comp"
+                  fi
+                done
+                echo "==> cross compilers wrapped with -Wno-stringop-overread"
+              fi
               exec "$@"
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
