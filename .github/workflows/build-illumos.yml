@@ -49,8 +49,22 @@ jobs:
       run: |
         docker run --platform linux/amd64 --rm -v${{ github.workspace }}/dotnet:/dotnet -w /dotnet -e ROOTFS_DIR=/crossrootfs/x64 -e Compiler=gcc \
           mcr.microsoft.com/dotnet-buildtools/prereqs:${{ matrix.docker_tag }} \
-            ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
-              --arch x64 ${{ inputs.is_rtm && '--branding rtm' || '' }} -p:OfficialBuildId=$(date +%Y%m%d).99
+            bash -c '
+              set -e
+              # The prereqs image ships no ninja, but the runtime build defaults to ninja
+              # (eng/native/build-commons.sh sets __UseNinja=1 and hard-fails with
+              # "Unable to locate ninja!"), so install it before building.
+              if ! command -v ninja >/dev/null 2>&1; then
+                echo "==> ninja not found; installing ninja-build via apt"
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update
+                apt-get install -y --no-install-recommends ninja-build
+              fi
+              echo "==> ninja version: $(ninja --version)"
+              exec "$@"
+            ' _ \
+              ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
+                --arch x64 ${{ inputs.is_rtm && '--branding rtm' || '' }} -p:OfficialBuildId=$(date +%Y%m%d).99
 
     - name: List assets directory
       run: |
