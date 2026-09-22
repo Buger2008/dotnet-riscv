@@ -76,39 +76,47 @@ jobs:
               echo "==> ninja: $(command -v ninja) $(ninja --version)"
               echo "==> lld: $(command -v ld.lld || command -v lld || echo MISSING)"
 
-              # The crossrootfs only ships the x86_64-illumos- prefixed linker names
-              # (x86_64-illumos-ld), while the cross gcc looks for the name reported
-              # below. The gcc always prefixes it, so an alias can never shadow the
-              # host linker used by the host parts of the build.
+              # The illumos cross gcc resolves its linker inside its own target
+              # directory (<exec-prefix>/<target>/bin/ld), so a linker installed
+              # into the PATH is not enough: the build inherits -fuse-ld=lld from
+              # the clang-based compiler setup and then dies with
+              # "collect2: fatal error: cannot find 'ld'".
+              # Probe the actual link, then force the bfd (GNU ld) linker, which is
+              # the one this toolchain actually ships.
               CROSS_BIN=/crossrootfs/x64/bin
               CROSS_CC=$CROSS_BIN/x86_64-illumos-gcc
-              for prog in ld ld.bfd; do
-                want=$("$CROSS_CC" -print-prog-name="$prog" 2>/dev/null || true)
-                echo "==> gcc -print-prog-name=$prog -> ${want:-<empty>}"
-                case "$want" in
-                  /*) [ -e "$want" ] || ln -sf "$CROSS_BIN/x86_64-illumos-$prog" "$want" ;;
-                  ""|"$prog") : ;;
-                  *)
-                    for dir in "$CROSS_BIN" /usr/local/bin; do
-                      [ -e "$dir/$want" ] || ln -sf "$CROSS_BIN/x86_64-illumos-$prog" "$dir/$want"
-                    done
-                    ;;
-                esac
-              done
-
-              # Link a trivial program the same way CMake will, and report which
-              # linker each candidate resolves to, so any failure is diagnosable
-              # from this log without another round trip.
               printf "int main(void){return 0;}\n" > /tmp/probe.c
+              cross_link() {
+                "$CROSS_CC" --sysroot=/crossrootfs/x64 "$@" /tmp/probe.c -o /tmp/probe -lssp
+              }
+              echo "==> gcc -print-prog-name=ld -> $("$CROSS_CC" -print-prog-name=ld 2>/dev/null || true)"
               for cand in "" "-fuse-ld=lld" "-fuse-ld=bfd"; do
-                if "$CROSS_CC" --sysroot=/crossrootfs/x64 $cand /tmp/probe.c -o /tmp/probe -lssp >/dev/null 2>/tmp/probe.err; then
-                  used=$("$CROSS_CC" -v --sysroot=/crossrootfs/x64 $cand /tmp/probe.c -o /tmp/probe -lssp 2>&1 | grep -o "/[^ ]*ld[.a-z0-9-]*" | tail -1 || true)
-                  echo "==> cross link OK    : ${cand:-<compiler default>} (linker: ${used:-unknown})"
+                if cross_link $cand >/dev/null 2>/tmp/probe.err; then
+                  used=$("$CROSS_CC" -v --sysroot=/crossrootfs/x64 $cand /tmp/probe.c -o /tmp/probe -lssp 2>&1 | tail -1 || true)
+                  echo "==> cross link OK    : ${cand:-<compiler default>} :: ${used:-unknown}"
                 else
                   echo "==> cross link FAILED: ${cand:-<compiler default>}"
-                  sed -n "1,4p" /tmp/probe.err
+                  sed -n "1,3p" /tmp/probe.err
                 fi
               done
+
+              # EXTRA_LDFLAGS is appended after the inherited LDFLAGS by
+              # eng/native/build-commons.sh, so it wins over the bogus -fuse-ld=lld.
+              if ! cross_link -fuse-ld=lld >/dev/null 2>&1 && cross_link -fuse-ld=bfd >/dev/null 2>&1; then
+                HOST_CC=$(command -v clang-18 || command -v clang || true)
+                if [ -z "$HOST_CC" ] || "$HOST_CC" -fuse-ld=bfd /tmp/probe.c -o /tmp/probe.host >/dev/null 2>&1; then
+                  export EXTRA_LDFLAGS="-fuse-ld=bfd"
+                  echo "==> forcing EXTRA_LDFLAGS=-fuse-ld=bfd"
+                else
+                  # The host clang rejects the flag, so make the requested lld name
+                  # resolvable where this cross gcc looks for its linker instead.
+                  TARGET_BIN=$(dirname "$("$CROSS_CC" -print-prog-name=ld 2>/dev/null || echo /crossrootfs/x64/x86_64-sun-solaris2.11/bin/ld)")
+                  mkdir -p "$TARGET_BIN"
+                  ln -sf "$(command -v ld.lld || echo /usr/bin/ld.lld)" "$TARGET_BIN/ld.lld"
+                  echo "==> host clang rejects -fuse-ld=bfd; aliased ld.lld into $TARGET_BIN"
+                fi
+              fi
+              echo "==> EXTRA_LDFLAGS=${EXTRA_LDFLAGS:-<unset>}"
               exec "$@"
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
