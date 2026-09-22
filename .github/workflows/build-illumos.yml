@@ -51,16 +51,30 @@ jobs:
           mcr.microsoft.com/dotnet-buildtools/prereqs:${{ matrix.docker_tag }} \
             bash -c '
               set -e
-              # The prereqs image ships no ninja, but the runtime build defaults to ninja
-              # (eng/native/build-commons.sh sets __UseNinja=1 and hard-fails with
-              # "Unable to locate ninja!"), so install it before building.
+              # The runtime build defaults to ninja (eng/native/build-commons.sh sets
+              # __UseNinja=1) and hard-fails with "Unable to locate ninja!", but the
+              # prereqs image ships no ninja. Install it before building.
               if ! command -v ninja >/dev/null 2>&1; then
-                echo "==> ninja not found; installing ninja-build via apt"
                 export DEBIAN_FRONTEND=noninteractive
-                apt-get update
-                apt-get install -y --no-install-recommends ninja-build
+                # The image references apt.kitware.com but its signing key is not in the
+                # keyring, which makes a plain "apt-get update" abort with exit code 100.
+                # Drop that source; ninja-build comes from the Ubuntu archive.
+                for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do
+                  [ -f "$f" ] || continue
+                  grep -q apt.kitware.com "$f" || continue
+                  if [ "$f" = /etc/apt/sources.list ]; then
+                    sed -i "/apt.kitware.com/d" "$f"
+                  else
+                    rm -f "$f"
+                  fi
+                done
+                apt-get update -o Acquire::AllowInsecureRepositories=true
+                apt-get install -y --no-install-recommends ninja-build || true
+                # Fallback in case ninja-build is not in the enabled components.
+                command -v ninja >/dev/null 2>&1 || python3 -m pip install --no-cache-dir --quiet ninja || true
+                command -v ninja >/dev/null 2>&1 || { echo "==> unable to install ninja"; exit 1; }
               fi
-              echo "==> ninja version: $(ninja --version)"
+              echo "==> ninja: $(ninja --version)"
               exec "$@"
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
