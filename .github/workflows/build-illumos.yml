@@ -32,6 +32,16 @@ jobs:
     permissions:
       contents: write
     steps:
+    - name: Report runner and disk
+      run: |
+        echo "==> cpus"
+        nproc
+        lscpu | sed -n '1,12p' || true
+        echo "==> memory"
+        free -h || true
+        echo "==> disk"
+        df -h
+
     - name: Maximize build space
       uses: AdityaGarg8/remove-unwanted-software@v4.1
       with:
@@ -168,10 +178,47 @@ jobs:
                 done
                 echo "==> cross compilers wrapped with -Wno-stringop-overread -Wno-error"
               fi
+              # ASP.NET Core tool projects are published per RID, but their assets file is
+              # restored without the target RID, so the publish step fails with NETSDK1047
+              # ("assets file ... doesn't have a target for net11.0/<rid>"). Append the
+              # target RID to RuntimeIdentifiers. Written without single quotes on purpose:
+              # the whole script sits inside bash -c '...'.
+              for proj in /dotnet/src/aspnetcore/src/Tools/dotnet-dev-certs/src/dotnet-dev-certs.csproj \
+                          /dotnet/src/aspnetcore/src/Tools/dotnet-user-jwts/src/dotnet-user-jwts.csproj \
+                          /dotnet/src/aspnetcore/src/Tools/dotnet-user-secrets/src/dotnet-user-secrets.csproj; do
+                [ -f "$proj" ] || continue
+                before=$(grep -c TargetRuntimeIdentifier "$proj" || true)
+                sed -i "/<RuntimeIdentifiers Condition=/a\    <RuntimeIdentifiers>\$(RuntimeIdentifiers);\$(TargetRuntimeIdentifier)</RuntimeIdentifiers>" "$proj"
+                after=$(grep -c TargetRuntimeIdentifier "$proj" || true)
+                echo "==> $proj: RuntimeIdentifiers refs $before -> $after"
+              done
+
+              # The VMR redirects each repo output to
+              # artifacts/log/Release/<repo>/<repo>.log and only replays it once that repo
+              # finishes, so the job log would otherwise stay silent for hours. Emit the last
+              # line of the active log (plus free disk) every 60s.
+              echo "==> cpus: $(nproc)"
+              ( while true; do
+                  sleep 60
+                  LOG=$(ls -t /dotnet/artifacts/log/Release/*/*.log 2>/dev/null | head -1 || true)
+                  FREE=$(df -h /dotnet | awk "NR==2{print \$4}")
+                  LAST=$(tail -n1 "$LOG" 2>/dev/null | tr -d "\r" | cut -c1-150)
+                  printf "[heartbeat %s] disk %s free | %s\n" "$(date +%H:%M:%S)" "$FREE" "$LAST"
+                done ) &
               exec "$@"
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
-                --arch x64 ${{ inputs.is_rtm && '--branding rtm' || '' }} -p:OfficialBuildId=$(date +%Y%m%d).99
+                --arch x64 ${{ inputs.is_rtm && '--branding rtm' || '' }} -p:OfficialBuildId=$(date +%Y%m%d).99 \
+                -p:PublishReadyToRun=false
+
+    - name: Report disk and artifacts usage
+      if: always()
+      run: |
+        echo "==> disk"
+        df -h
+        echo "==> artifacts"
+        du -sh "${{ github.workspace }}/dotnet/artifacts" 2>/dev/null || true
+        du -sh "${{ github.workspace }}/dotnet/artifacts"/* 2>/dev/null | sort -h | tail -10 || true
 
     - name: List assets directory
       run: |
