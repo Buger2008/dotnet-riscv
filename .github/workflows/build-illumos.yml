@@ -127,30 +127,46 @@ jobs:
                 echo "==> still cannot link with -fuse-ld=lld; failing fast"
                 exit 1
               fi
-              # GCC 13 raises a false positive in src/coreclr/vm/common.h (the
-              # inlined memcpy in memcpyNoGCRefs) that -Werror turns into a hard
-              # failure: "error: reading 16 bytes from a region of size 0
-              # [-Werror=stringop-overread]". configurecompiler.cmake already
-              # suppresses the sibling warnings for GCC, so add this one there.
-              # Env vars (CFLAGS/EXTRA_*) cannot be used: the VMR runs the repo
+              # GCC 13 produces false positives that -Werror turns into hard failures:
+              #   vm/common.h:181  ... reading 16 bytes from a region of size 0
+              #                        [-Werror=stringop-overread]
+              #   jit/gentree.cpp  ... 'this' pointer is null [-Werror=nonnull]
+              # -Werror only exists because prerelease builds enable it
+              # (configurecompiler.cmake: "if (PRERELEASE) add_compile_options(-Werror)"),
+              # and its suppression list already covers the sibling warnings. Patch that
+              # list in every repo of the VMR: add the missing -Wno-stringop-overread and
+              # a -Wno-error so further false positives stay warnings instead of killing
+              # the build after ~40 minutes. Warnings are still printed in full.
+              # Env vars (CFLAGS/EXTRA_*) cannot be used here: the VMR runs the repo
               # builds in a sanitised child environment.
-              CCF=/dotnet/src/runtime/eng/native/configurecompiler.cmake
-              if [ -f "$CCF" ] && ! grep -q stringop-overread "$CCF"; then
-                sed -i "s#COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>)#COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>)\n    add_compile_options(\$<\$<COMPILE_LANGUAGE:CXX>:-Wno-stringop-overread>)#" "$CCF"
-              fi
-              if grep -q stringop-overread "$CCF" 2>/dev/null; then
-                echo "==> suppressed: $(grep -n stringop-overread "$CCF" | tr "\n" " ")"
-              else
-                echo "==> could not patch configurecompiler.cmake; wrapping the cross compilers instead"
+              PATCHED=0
+              for CCF in /dotnet/src/*/eng/native/configurecompiler.cmake; do
+                [ -f "$CCF" ] || continue
+                if grep -q stringop-overread "$CCF"; then
+                  PATCHED=1
+                  continue
+                fi
+                if ! grep -q "COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>" "$CCF"; then
+                  continue
+                fi
+                sed -i "s#COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>)#COMPILE_LANGUAGE:CXX>:-Wno-stringop-overflow>)\n    add_compile_options(\$<\$<COMPILE_LANGUAGE:CXX>:-Wno-stringop-overread>)\n    add_compile_options(-Wno-error)#" "$CCF"
+                if grep -q stringop-overread "$CCF"; then
+                  PATCHED=1
+                  echo "==> patched: $CCF"
+                  grep -n "stringop-overread\|Wno-error)" "$CCF" | sed "s/^/    /"
+                fi
+              done
+              if [ "$PATCHED" = 0 ]; then
+                echo "==> no configurecompiler.cmake patched; wrapping the cross compilers instead"
                 for comp in gcc g++; do
                   real=/crossrootfs/x64/bin/x86_64-illumos-$comp-real
                   if [ ! -e "$real" ]; then
                     mv "/crossrootfs/x64/bin/x86_64-illumos-$comp" "$real"
-                    printf "%s\n" "#!/bin/sh" "exec $real -Wno-stringop-overread \"\$@\"" > "/crossrootfs/x64/bin/x86_64-illumos-$comp"
+                    printf "%s\n" "#!/bin/sh" "exec $real -Wno-stringop-overread -Wno-error \"\$@\"" > "/crossrootfs/x64/bin/x86_64-illumos-$comp"
                     chmod +x "/crossrootfs/x64/bin/x86_64-illumos-$comp"
                   fi
                 done
-                echo "==> cross compilers wrapped with -Wno-stringop-overread"
+                echo "==> cross compilers wrapped with -Wno-stringop-overread -Wno-error"
               fi
               exec "$@"
             ' _ \
