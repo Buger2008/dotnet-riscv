@@ -299,14 +299,24 @@ jobs:
         du -sh "${{ github.workspace }}/dotnet/artifacts" 2>/dev/null || true
         du -sh "${{ github.workspace }}/dotnet/artifacts"/* 2>/dev/null | sort -h | tail -10 || true
 
+    # The SDK tarball is produced by the sdk repo build, i.e. before the VMR's final
+    # validation (it extracts the archive to run source-build leak detection). Keep
+    # both steps unconditional so a late validation failure does not throw away a
+    # multi-hour build: whatever tarball exists still gets listed and uploaded.
     - name: List assets directory
+      if: always()
       run: |
-        find "${{ github.workspace }}/dotnet/artifacts"
+        echo "==> Sdk assets"
+        ls -la "${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/"*/ || true
+        echo "==> tarballs"
+        find "${{ github.workspace }}/dotnet/artifacts/assets" -maxdepth 4 -name "*.tar.gz" -printf "%s\t%p\n" || true
 
     - name: Upload .NET
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: dotnet-sdk-${{ matrix.name }}
+        if-no-files-found: warn
         path: |
           ${{ github.workspace }}/dotnet/artifacts/assets/Release/Sdk/*/dotnet-sdk-*.tar.gz
 
