@@ -247,6 +247,31 @@ jobs:
           echo "==> WARNING: no sfxproj patched; aspnetcore R2R will fail again"
         fi
 
+              # 通用保险：把 R2R 相关属性注入到【每个 repo】的构建命令行。
+              # VMR 用 repo-projects/Directory.Build.targets 里的 $(BuildArgs) 拼命令行，
+              # 而那个文件就在我们的 checkout 里 —— 改它就能一次影响所有 repo。
+              # 命令行 /p: 是 MSBuild 全局属性，项目文件改不动它，比逐文件打补丁更硬。
+              # （sdk repo 的 CrossgenLayout 认 SkipUsingCrossgen；共享框架认 PublishReadyToRun。）
+              DBT=/dotnet/repo-projects/Directory.Build.targets
+              if [ -f "$DBT" ] && ! grep -q "illumos-extra-buildargs" "$DBT"; then
+                dbtlast=$(tail -n1 "$DBT" | tr -d "\r" | sed "s/[[:space:]]*$//")
+                if [ "$dbtlast" = "</Project>" ]; then
+                  head -n -1 "$DBT" > "$DBT.illumos-tmp"
+                  printf "%s\n" \
+                    "  <!-- illumos-extra-buildargs: crossgen2 has no illumos target os -->" \
+                    "  <PropertyGroup>" \
+                    "    <BuildArgs>\$(BuildArgs) /p:PublishReadyToRun=false /p:PublishReadyToRunComposite=false /p:CrossgenOutput=false /p:SkipUsingCrossgen=true</BuildArgs>" \
+                    "  </PropertyGroup>" \
+                    "</Project>" >> "$DBT.illumos-tmp"
+                  mv "$DBT.illumos-tmp" "$DBT"
+                fi
+              fi
+              if grep -q "illumos-extra-buildargs" "$DBT" 2>/dev/null; then
+                echo "==> BuildArgs injected (illumos-extra-buildargs present)"
+              else
+                echo "==> WARNING: could not inject BuildArgs; repos may crossgen for illumos"
+              fi
+
               # The VMR redirects each repo output to
               # artifacts/log/Release/<repo>/<repo>.log and only replays it once that repo
               # finishes, so the job log would otherwise stay silent for hours. Emit the last
@@ -263,7 +288,7 @@ jobs:
             ' _ \
               ./build.sh --clean-while-building --prep -sb --os ${{ matrix.name }} --rid ${{ matrix.name }}-x64 \
                 --arch x64 ${{ inputs.is_rtm && '--branding rtm' || '' }} -p:OfficialBuildId=$(date +%Y%m%d).99 \
-                -p:PublishReadyToRun=false
+                -p:PublishReadyToRun=false -p:SkipUsingCrossgen=true
 
     - name: Report disk and artifacts usage
       if: always()
