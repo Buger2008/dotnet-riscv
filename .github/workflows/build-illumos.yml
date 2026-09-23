@@ -272,6 +272,25 @@ jobs:
                 echo "==> WARNING: could not inject BuildArgs; repos may crossgen for illumos"
               fi
 
+              # 7) illumos 没有 overcommit：匿名预留会真记账到 swap，导致 CoreCLR 起不来。
+              #    truss 实测：进程先留 1.86G，GC 还要 1.98G，而 2G 内存/2G swap 的机器预算只有 ~2G
+              #    -> mmap PROT_NONE 全部 EAGAIN -> GC heap initialization failed 0x8007000E。
+              #    上游给 Haiku（同样没有 overcommit）就是这么修的：minipal/Unix/doublemapping.cpp
+              #    里 #ifdef TARGET_HAIKU 时 mmapFlags |= MAP_NORESERVE。illumos 有同一个旗标
+              #    (sys/mman.h: #define MAP_NORESERVE 0x40)，所以照做，只加在纯预留路径。
+              #    注意：限堆参数无效（那个 1.86G 预留不是 GC 堆），只能在这里改。
+              GCENV=/dotnet/src/runtime/src/coreclr/gc/unix/gcenv.unix.cpp
+              if [ -f "$GCENV" ] && ! grep -q "illumos-noreserve" "$GCENV"; then
+                sed -i "/int mmapFlags = MAP_ANON | MAP_PRIVATE | hugePagesFlag;/a\\
+            // illumos-noreserve: illumos has no overcommit, so anonymous reservations are charged against\n    // swap. A pure address-space reservation must opt out, exactly like the Haiku branch in\n    // minipal/Unix/doublemapping.cpp does.\n    if (!committing)\n    {\n        mmapFlags |= MAP_NORESERVE;\n    }" "$GCENV"
+              fi
+              if grep -q "illumos-noreserve" "$GCENV" 2>/dev/null; then
+                echo "==> gcenv.unix.cpp patched: reservations use MAP_NORESERVE"
+              else
+                echo "==> WARNING: could not patch gcenv.unix.cpp; CoreCLR will fail on small-memory hosts"
+              fi
+              echo "==> patch applied: $(grep -c illumos-noreserve "$GCENV" 2>/dev/null || echo 0)"
+
               # The VMR redirects each repo output to
               # artifacts/log/Release/<repo>/<repo>.log and only replays it once that repo
               # finishes, so the job log would otherwise stay silent for hours. Emit the last
