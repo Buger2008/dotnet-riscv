@@ -183,22 +183,40 @@ jobs:
                 done
                 echo "==> cross compilers wrapped with -Wno-stringop-overread -Wno-error"
               fi
-              # ASP.NET Core tool projects are published per RID, but their assets file is
-              # restored without the target RID, so the publish step fails with NETSDK1047
-              # ("assets file ... does not have a target for net11.0/<rid>"). Append the
-              # target RID to RuntimeIdentifiers.
+              # ASP.NET Core tool projects are published with the target RID while their
+              # assets file was restored without it, so the build dies with NETSDK1047
+              # ("assets file ... does not have a target for net11.0/illumos-x64").
+              # Upstream sets RuntimeIdentifiers only inside a PropertyGroup gated on
+              # NativeAotSupported == true, and eng/common/native/NativeAotSupported.props
+              # explicitly rejects illumos, so that whole group is skipped here and the RID
+              # never reaches restore. Injecting a line inside that gated group therefore
+              # does nothing - the earlier attempt proved it (it ran, and NETSDK1047 stayed).
+              # Add an unconditional PropertyGroup in front of the closing tag instead: it
+              # is the last assignment in the project body, so nothing upstream overrides it.
               # NOTE: this script is the argument of bash -c, so a single quote is not
               # allowed anywhere inside it - an apostrophe in a comment truncates the
               # command (that is what broke the previous run).
-              for proj in /dotnet/src/aspnetcore/src/Tools/dotnet-dev-certs/src/dotnet-dev-certs.csproj \
-                          /dotnet/src/aspnetcore/src/Tools/dotnet-user-jwts/src/dotnet-user-jwts.csproj \
-                          /dotnet/src/aspnetcore/src/Tools/dotnet-user-secrets/src/dotnet-user-secrets.csproj; do
-                [ -f "$proj" ] || continue
-                before=$(grep -c TargetRuntimeIdentifier "$proj" || true)
-                sed -i "/<RuntimeIdentifiers Condition=/a\    <RuntimeIdentifiers>\$(RuntimeIdentifiers);\$(TargetRuntimeIdentifier)</RuntimeIdentifiers>" "$proj"
-                after=$(grep -c TargetRuntimeIdentifier "$proj" || true)
-                echo "==> $proj: RuntimeIdentifiers refs $before -> $after"
+              ridfix=0
+              for proj in $(grep -rl BundledToolTargetRuntimeIdentifiers /dotnet/src/aspnetcore/src/Tools --include="*.csproj" 2>/dev/null || true); do
+                grep -q illumos-rid-fix "$proj" && continue
+                last=$(tail -n1 "$proj" | tr -d "\r" | sed "s/[[:space:]]*$//")
+                [ "$last" = "</Project>" ] || continue
+                head -n -1 "$proj" > "$proj.illumos-tmp"
+                printf "%s\n" \
+                  "  <!-- illumos-rid-fix: NativeAotSupported is false on illumos, so the gated group above never runs -->" \
+                  "  <PropertyGroup>" \
+                  "    <RuntimeIdentifiers>\$(RuntimeIdentifiers);\$(TargetRuntimeIdentifier)</RuntimeIdentifiers>" \
+                  "    <PublishReadyToRun>false</PublishReadyToRun>" \
+                  "  </PropertyGroup>" \
+                  "</Project>" >> "$proj.illumos-tmp"
+                mv "$proj.illumos-tmp" "$proj"
+                grep -q illumos-rid-fix "$proj" && ridfix=$((ridfix+1))
+                echo "==> rid fix applied: $proj"
               done
+              echo "==> rid fix applied to $ridfix tool csproj"
+              if [ "$ridfix" = 0 ]; then
+                echo "==> WARNING: no tool csproj patched; NETSDK1047 will come back"
+              fi
 
         # crossgen2 的 GetTargetOS 不认 illumos（token 列表里没有 illumos），而共享框架的
         # sfxproj 在 Release 下默认 PublishReadyToRun=true，于是 R2R 必然失败：
