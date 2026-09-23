@@ -200,6 +200,35 @@ jobs:
                 echo "==> $proj: RuntimeIdentifiers refs $before -> $after"
               done
 
+        # crossgen2 的 GetTargetOS 不认 illumos（token 列表里没有 illumos），而共享框架的
+        # sfxproj 在 Release 下默认 PublishReadyToRun=true，于是 R2R 必然失败：
+        # NETSDK1096 + "Target OS illumos is not supported"。
+        # R2R 的触发条件就是 CreateReadyToRunImages 上的 PublishReadyToRun == true，
+        # 所以在每个 sfxproj 末尾追加覆盖（同一文件内后出现的赋值生效）。
+        # 命令行 -p: 不会转发到各 repo 的构建，改文件才可靠。
+        r2r=0
+        for f in $(find /dotnet/src -name "*.sfxproj" -not -path "*/artifacts/*" 2>/dev/null); do
+          grep -q "ReadyToRun" "$f" || continue
+          grep -q "illumos-disable-r2r" "$f" && continue
+          last=$(tail -n1 "$f" | tr -d "\r")
+          [ "$last" = "</Project>" ] || continue
+          head -n -1 "$f" > "$f.illumos-tmp"
+          printf "%s\n" \
+            "  <!-- illumos-disable-r2r: crossgen2 has no illumos target os -->" \
+            "  <PropertyGroup>" \
+            "    <PublishReadyToRun>false</PublishReadyToRun>" \
+            "    <PublishReadyToRunComposite>false</PublishReadyToRunComposite>" \
+            "    <CrossgenOutput>false</CrossgenOutput>" \
+            "  </PropertyGroup>" \
+            "</Project>" >> "$f.illumos-tmp"
+          mv "$f.illumos-tmp" "$f"
+          grep -q "illumos-disable-r2r" "$f" && r2r=$((r2r+1))
+        done
+        echo "==> r2r disabled in $r2r sfxproj"
+        if [ "$r2r" = 0 ]; then
+          echo "==> WARNING: no sfxproj patched; aspnetcore R2R will fail again"
+        fi
+
               # The VMR redirects each repo output to
               # artifacts/log/Release/<repo>/<repo>.log and only replays it once that repo
               # finishes, so the job log would otherwise stay silent for hours. Emit the last
