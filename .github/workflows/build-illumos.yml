@@ -1,6 +1,11 @@
 name: Build .NET SDK for illumos-x64
 
 on:
+  # 每天 00:00 UTC（格林尼治时间）自动构建，并发布一个测试版 prerelease。
+  # GitHub 的 cron 一律按 UTC 解释，所以 '0 0 * * *' 就是北京时间 08:00。
+  # 注意：仓库若连续 60 天无提交活动，GitHub 会自动停用计划任务（需手动重新启用）。
+  schedule:
+    - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       fork:
@@ -25,6 +30,12 @@ on:
         description: 'override CA bundle URL (default: use the one committed in this repo)'
         required: false
         type: string
+
+# 一次构建约 2 小时。计划任务与手动触发若撞在一起，让后来的排队而不是
+# 互相取消，免得把已经跑了很久的构建丢掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -72,8 +83,14 @@ jobs:
         path: _thisrepo
 
     - name: Clone dotnet VMR
+      env:
+        # workflow_dispatch 的输入默认值只在手动触发时生效；schedule 触发时
+        # inputs.* 全是空的，所以这里再兜一层默认值。
+        VMR_FORK: ${{ inputs.fork || 'dotnet' }}
+        VMR_BRANCH: ${{ inputs.branch || 'main' }}
       run: |
-        git clone --single-branch --depth 1 -b ${{ inputs.branch }} https://github.com/${{ inputs.fork }}/dotnet
+        echo "==> VMR $VMR_FORK @ $VMR_BRANCH"
+        git clone --single-branch --depth 1 -b "$VMR_BRANCH" "https://github.com/$VMR_FORK/dotnet"
 
     - name: Build
       run: |
@@ -443,9 +460,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # Defaults to true via the workflow_dispatch input default, so a plain
-    # "Run workflow" publishes a prerelease. Set the input to false to skip.
-    if: ${{ inputs.release }}
+    # workflow_dispatch 的 release 输入默认 true；schedule 触发时 inputs 全空，
+    # 所以显式让计划任务也发布。
+    if: ${{ github.event_name == 'schedule' || inputs.release }}
     steps:
     - name: Download artifacts
       uses: actions/download-artifact@v4
@@ -453,17 +470,14 @@ jobs:
         path: artifacts
 
     - name: Make release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -e
-        sudo apt-get update -qq && sudo apt-get install -y hub
-
-        # hub(1) requires release to be created inside a git repo
-        git clone https://${{ secrets.CLONE_TOKEN }}:x-oauth-basic@github.com/${{ github.repository }}.git repo
-        cd repo
 
         # The artifact root already carries the SDK tarball, the installer and the CA
         # bundle. Gather them into one directory so the release is self-contained:
-        # whoever downloads from the release page gets exactly the same three files.
+        # whoever downloads from the release page gets exactly the same files.
         STAGE=$(mktemp -d)
         for f in $(find ${{ github.workspace }}/artifacts -type f \
                      | grep -E '/(dotnet-sdk-.*\.tar\.gz|install-illumos\.sh|illumos-ca-bundle\.crt)$'); do
@@ -471,6 +485,9 @@ jobs:
         done
         ls -l "$STAGE"
 
+        # 版本号直接跟随上游 dotnet：SDK 产物名里的版本就是上游构建生成的
+        # <上游版本>-<构建号>[.<修订>]，这里只把它取出来当 tag，不另造版本体系，
+        # 也不加日期后缀 —— 上游版本变了，tag 自然变。
         tag_name=""
         for sdk_path in "$STAGE"/dotnet-sdk-*.tar.gz; do
           [ -f "$sdk_path" ] || continue
@@ -487,16 +504,17 @@ jobs:
         # A single checksum file covering the whole release payload.
         ( cd "$STAGE" && sha256sum ./* > SHA256SUMS.txt )
 
-        artifacts=""
-        for f in "$STAGE"/*; do
-          artifacts="$artifacts -a $f"
-        done
+        echo "tag_name: $tag_name"
 
-        echo "tag_name : $tag_name"
-        echo "artifacts: $artifacts"
-
-        # docs: https://hub.github.com/hub-release.1.html
-        hub release create $artifacts --prerelease -m "$tag_name" "$tag_name" \
-          || hub release edit -a "$artifacts" -m "$tag_name" "$tag_name"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Use the preinstalled gh CLI rather than hub: no apt-get, no clone (hub
+        # needed a git repo), and --clobber lets a nightly that produced the same
+        # build id replace the previous assets instead of failing.
+        if gh release view "$tag_name" >/dev/null 2>&1; then
+          echo "==> release $tag_name already exists; replacing its assets"
+          gh release upload "$tag_name" "$STAGE"/* --clobber
+          gh release edit "$tag_name" --prerelease --title "$tag_name"
+        else
+          echo "==> creating prerelease $tag_name"
+          gh release create "$tag_name" "$STAGE"/* --prerelease --title "$tag_name" \
+            --notes "Automated illumos-x64 build of $tag_name. Assets: the SDK tarball, install-illumos.sh, illumos-ca-bundle.crt and SHA256SUMS.txt. Install on the target machine with: sudo bash install-illumos.sh dotnet-sdk-*-illumos-x64.tar.gz"
+        fi
