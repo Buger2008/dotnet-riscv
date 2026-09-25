@@ -14,6 +14,7 @@
 #   System.Net.Security          -> NuGet 走 HTTPS 直接失败（NU1301 / NU3018）
 #   System.Net.Quic              -> HTTP/3 不可用
 #   System.IO.FileSystem.Watcher -> FileSystemWatcher 直接抛异常
+#     （换 dll 只解决托管层；原生层是 ENOTSUP 桩，需 3.5 节的垫片才真正可用）
 #
 # 另外 illumos 的 CA 证书库不在 .NET/NuGet 默认查找的 /etc/ssl/certs，
 # 且缺少微软代码签名链依赖的老根证书（DigiCert Assured ID Root CA），
@@ -32,7 +33,10 @@
 #        DOTNET_ROOT / PATH / SSL_CERT_FILE / SSL_CERT_DIR / DOTNET_ReadyToRun=0
 #      DOTNET_ReadyToRun=0 是关键：替换进来的官方程序集带 R2R 预编译代码，
 #      illumos 加载会 core dump，必须强制 JIT。
-#   6. 自检：dotnet --version + 在线 restore 冒烟
+#   6. FileSystemWatcher 原生垫片（见 3.5 节）：用 portfs 实现用户态
+#      inotify，再以 PAL 垫片替换 libSystem.Native.so 里的三个 ENOTSUP 桩。
+#      仅当 watcher dll 被替换过时才做；失败自动回滚。
+#   7. 自检：dotnet --version + 在线 restore 冒烟
 #
 # 用法
 # ----
@@ -55,6 +59,8 @@
 #   --no-dlls           不替换 dll（只装证书 / 环境变量）
 #   --no-certs          不装证书
 #   --no-profile        不写 /etc/profile.d
+#   --no-fsw-shim       不做 FileSystemWatcher 垫片（保持 ENOTSUP 桩）
+#   --fsw-shim          强制做/重做 FileSystemWatcher 垫片（dll 已换过也能用）
 #   --force             覆盖已存在的前缀（默认改名保留为 .old-<时间戳>）
 #   --dry-run           只检测与报告，不改动任何东西
 #   -y                  不询问
@@ -70,11 +76,14 @@ DLL_LIST=""
 DO_DLLS=1
 DO_CERTS=1
 DO_PROFILE=1
+DO_FSW=1
+FSW_NEEDED=0
+FSW_FORCE=0
 FORCE=0
 DRY=0
 TARBALL=""
 
-usage() { sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { awk 'NR>1 && /^set -euo pipefail/ {exit} NR>1 {sub(/^# ?/,""); print}' "$0"; exit 0; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -91,6 +100,8 @@ while [ $# -gt 0 ]; do
     --no-dlls)    DO_DLLS=0; shift ;;
     --no-certs)   DO_CERTS=0; shift ;;
     --no-profile) DO_PROFILE=0; shift ;;
+    --no-fsw-shim) DO_FSW=0; shift ;;
+    --fsw-shim)   DO_FSW=1; FSW_FORCE=1; shift ;;
     --force)      FORCE=1; shift ;;
     --dry-run)    DRY=1; shift ;;
     -y|--yes)     shift ;;
@@ -679,9 +690,983 @@ PYEOF
           n=$((n + 1))
         done
         c_ok "共替换 $n 个程序集，原件备份在 $BK"
+        case "$(echo "$PLAN" | tr '\n' ' ')" in
+          *"System.IO.FileSystem.Watcher.dll"*) FSW_NEEDED=1 ;;
+        esac
       fi
       rm -rf "$WORK"
     fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 3.5) FileSystemWatcher 原生垫片（PAL shim -> 用户态 inotify on portfs）
+# ---------------------------------------------------------------------------
+# 背景
+#   第 3 步把 System.IO.FileSystem.Watcher.dll 换成了官方 linux 版，托管层于是
+#   会去 P/Invoke libSystem.Native 里的三个入口。但那份 .so 是在 illumos 上
+#   编译出来的，编译期 HAVE_INOTIFY=0，三个函数被打成 ENOTSUP 空壳
+#   （各 24~26 字节），而且**完全不引用任何 inotify 符号**：
+#
+#       elfdump -d libSystem.Native.so | grep -c inotify   ->  0
+#
+#   于是两条常见思路都不成立（都实测过）：
+#     - 装个用户态 inotify 库再 LD_PRELOAD  -> 无效，二进制里没有符号引用
+#     - 用 LD_LIBRARY_PATH 换掉这个 .so     -> 无效，.NET 不按环境变量找框架库
+#   唯一可行的做法是在 **PAL 层**做垫片，原理见下面 pal_shim.c 的头部注释。
+#
+# 本步做的事
+#   1. 用 portfs(PORT_SOURCE_FILE) 实现一个用户态 inotify -> libillumos_inotify.so
+#   2. 原 libSystem.Native.so 复制为 libSNative.so，并原地改掉它的 SONAME
+#      （不改 SONAME 的话 ld 会以 "recording name conflict" 直接拒绝链接）
+#   3. 编出同名垫片 libSystem.Native.so：只覆盖那 3 个符号，其余 200+ 符号
+#      经 DT_NEEDED 依赖链透传到 libSNative.so
+#   4. C 层自检（dlopen + dlsym + 实调），失败自动回滚
+#
+# 原始库只在首次安装时备份到 $PREFIX/.fsw-shim-orig/，可据此手动回滚：
+#     cp -p $PREFIX/.fsw-shim-orig/*.libSystem.Native.so <框架目录>/libSystem.Native.so
+#     rm -f <框架目录>/libSNative.so <框架目录>/libillumos_inotify.so
+# ---------------------------------------------------------------------------
+if [ "$DO_FSW" = "1" ] && { [ "$FSW_NEEDED" = "1" ] || [ "$FSW_FORCE" = "1" ]; }; then
+  if [ "$DRY" = "1" ]; then
+    c_ok "[dry-run] 将为 FileSystemWatcher 构建 portfs 用户态 inotify + PAL 垫片"
+  elif ! command -v gcc >/dev/null 2>&1; then
+    c_warn "未找到 gcc，跳过 FileSystemWatcher 垫片"
+    c_warn "  -> FileSystemWatcher 仍会抛 PlatformNotSupportedException"
+    c_warn "  -> 装上 gcc 后重跑本脚本即可：pkg install developer/gcc-13"
+  elif [ ! -f /usr/include/port.h ]; then
+    c_warn "缺 /usr/include/port.h（portfs 声明），跳过 FileSystemWatcher 垫片"
+  else
+    FSW_DIR="$(mktemp -d "${TMPDIR:-/tmp}/illumos-fsw.XXXXXX")"
+    ORIG_STORE="$PREFIX/.fsw-shim-orig"
+    mkdir -p "$ORIG_STORE"
+    c_info "构建 FileSystemWatcher 垫片（用户态 inotify on portfs）"
+
+    cat > "$FSW_DIR/illumos_inotify.c" <<'ILLUMOS_INOTIFY_C_EOF'
+/*
+ * illumos_inotify.c — portfs(event ports) 后端的用户态 inotify 兼容层
+ * =============================================================================
+ *
+ * 为什么需要它
+ * ------------
+ * illumos 没有内核 inotify：
+ *   - illumos-gate 里不存在（/usr/include/sys/inotify.h 无、libc.so.1 零符号）
+ *   - 只有 SmartOS / illumos-joyent 有，且从未 upstream
+ *   - FreeBSD/OpenBSD 用的 libinotify 是 kqueue 后端，illumos 没有 kqueue
+ * 所以只能基于 portfs(PORT_SOURCE_FILE) 在用户态模拟。
+ *
+ * 导出接口（与 Linux inotify 二进制兼容）
+ * ---------------------------------------
+ *   int inotify_init1(int flags);
+ *   int inotify_add_watch(int fd, const char *path, uint32_t mask);
+ *   int inotify_rm_watch(int fd, int wd);
+ *
+ * 设计
+ * ----
+ *   init1()  : port_create() 建事件端口；socketpair() 建"事件管道"；
+ *              起一个后台线程，把 portfs 事件翻译成 struct inotify_event
+ *              写进管道；返回**管道读端**作为 inotify fd。
+ *              这样 read()/poll()/close() 的语义与真 inotify 一致。
+ *   add_watch(): 目录 → port_associate 目录本身（拿 name 级变化：增/删/改名）
+ *                     ＋ 对目录内每个普通文件 port_associate（拿内容修改）
+ *                文件 → 直接 port_associate 该文件
+ *
+ * 两个必须处理的 portfs 语义差异
+ * ------------------------------
+ *   1) portfs 只通知"这个对象变了"，不告诉你变了什么
+ *      → 目录级靠**快照比对**还原出 CREATE/DELETE/MOVED/MODIFY
+ *   2) 事件被取走一次后关联**自动解除**
+ *      → 每次 port_get 后必须重新 port_associate，否则只收到一次通知
+ *
+ * 已知限制
+ * --------
+ *   - 每个被监视目录最多对 ILLUMOS_INOTIFY_MAX_FILES 个文件做关联（默认 512），
+ *     超出部分的内容修改不会被感知（name 级事件不受影响）
+ *   - rename 靠 (isdir, size, mtime) 启发式配对，个别场景会退化成 DELETE+CREATE
+ *   - IN_ACCESS / IN_OPEN / IN_CLOSE_* 不产生（portfs 无对应事件源）
+ *
+ * 构建
+ * ----
+ *   gcc -O2 -shared -fPIC -o libillumos_inotify.so illumos_inotify.c -lpthread
+ */
+
+#define _POSIX_PTHREAD_SEMANTICS 1
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <dirent.h>
+#include <pthread.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/port.h>      /* PORT_SOURCE_FILE / FILE_* / struct file_obj / port_event_t */
+#include <port.h>          /* port_create / port_associate / port_get ... 的声明 */
+#include <limits.h>
+
+/* ---------------------------------------------------------------------------
+ * inotify 常量与结构（illumos 无 sys/inotify.h，此处按 Linux ABI 自定义）
+ * ------------------------------------------------------------------------ */
+#define IN_ACCESS        0x00000001u
+#define IN_MODIFY        0x00000002u
+#define IN_ATTRIB        0x00000004u
+#define IN_CLOSE_WRITE   0x00000008u
+#define IN_CLOSE_NOWRITE 0x00000010u
+#define IN_OPEN          0x00000020u
+#define IN_MOVED_FROM    0x00000040u
+#define IN_MOVED_TO      0x00000080u
+#define IN_CREATE        0x00000100u
+#define IN_DELETE        0x00000200u
+#define IN_DELETE_SELF   0x00000400u
+#define IN_MOVE_SELF     0x00000800u
+#define IN_Q_OVERFLOW    0x00004000u
+#define IN_IGNORED       0x00008000u
+#define IN_ISDIR         0x40000000u
+
+struct inotify_event {
+    int      wd;
+    uint32_t mask;
+    uint32_t cookie;
+    uint32_t len;
+    char     name[];
+};
+
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
+
+#define MAX_WATCH     256          /* 每个实例最大 watch 数 */
+#define MAX_FILES     512          /* 每个目录最多做文件级关联的数量 */
+#define EVENT_COOKIE  0x1A2B       /* MOVED_FROM/TO 配对的 cookie 基值 */
+
+#ifdef ILLUMOS_INOTIFY_DEBUG
+#define DBG(...) do { fprintf(stderr, "[inotify] " __VA_ARGS__); } while (0)
+#else
+#define DBG(...) do { } while (0)
+#endif
+
+struct entry {
+    char   name[NAME_MAX + 1];
+    int    isdir;
+    long   size;
+    time_t mtime;
+};
+
+struct watch {
+    int   used;
+    int   wd;
+    int   isdir;
+    char  path[PATH_MAX];
+    char *fo_name;              /* 目录路径；portfs 长期持有该指针 */
+    struct file_obj fo;         /* 必须长期存活 */
+    struct entry   *ents;
+    int             nents;
+    /* 文件级关联（仅目录监视时使用） */
+    struct file_obj *ffo;
+    char           **fname;
+    char           **fbase;     /* basename，用于事件里的 name */
+    int              nffo;
+};
+
+struct inst {
+    int              port;
+    int              wfd;       /* socketpair 写端 */
+    int              rfd;       /* socketpair 读端 = 对外的 inotify fd */
+    pthread_t        tid;
+    pthread_mutex_t  lock;
+    int              stop;
+    int              overflow;
+    struct watch     w[MAX_WATCH];
+    int              nextwd;
+};
+
+/* fd -> inst 注册表 */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct inst    *g_inst[1024];
+
+static struct inst *inst_of(int fd)
+{
+    struct inst *r = NULL;
+    int i;
+    if (fd < 0 || fd >= (int)(sizeof(g_inst) / sizeof(g_inst[0]))) return NULL;
+    pthread_mutex_lock(&g_lock);
+    for (i = 0; i < (int)(sizeof(g_inst) / sizeof(g_inst[0])); i++) {
+        if (g_inst[i] && g_inst[i]->rfd == fd) { r = g_inst[i]; break; }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return r;
+}
+
+static void inst_register(struct inst *in)
+{
+    int i, slot = -1;
+    pthread_mutex_lock(&g_lock);
+    for (i = 0; i < (int)(sizeof(g_inst) / sizeof(g_inst[0])); i++) {
+        if (g_inst[i] && g_inst[i]->rfd == in->rfd) {
+            /* fd 被复用：停掉旧实例 */
+            g_inst[i]->stop = 1;
+            g_inst[i] = NULL;
+            slot = i;
+            break;
+        }
+        if (!g_inst[i] && slot < 0) slot = i;
+    }
+    if (slot >= 0) g_inst[slot] = in;
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* ---------------------------------------------------------------------------
+ * 事件投递：把一条 struct inotify_event 写进 socketpair
+ * ------------------------------------------------------------------------ */
+static void emit(struct inst *in, int wd, uint32_t mask, uint32_t cookie,
+                 const char *name, int isdir)
+{
+    char buf[sizeof(struct inotify_event) + NAME_MAX + 8];
+    struct inotify_event *e = (struct inotify_event *)buf;
+    size_t nl = 0, total;
+    ssize_t n;
+
+    memset(buf, 0, sizeof(buf));
+    e->wd     = wd;
+    e->mask   = isdir ? (mask | IN_ISDIR) : mask;
+    e->cookie = cookie;
+
+    if (name && *name) {
+        size_t l = strlen(name) + 1;
+        nl = (l + 3u) & ~((size_t)3);      /* 4 字节对齐 */
+        if (nl > NAME_MAX + 8) nl = NAME_MAX + 8;
+        memcpy(e->name, name, l);
+    }
+    e->len = (uint32_t)nl;
+    total = sizeof(struct inotify_event) + nl;
+
+    /*
+     * 用 write() 而不是 send(MSG_NOSIGNAL)：illumos 的 socket.h 不保证提供
+     * MSG_NOSIGNAL；SIGPIPE 已由 worker 线程用 pthread_sigmask 屏蔽，
+     * 因此读端关闭时这里只会拿到 EPIPE，不会杀掉整个 .NET 进程。
+     */
+    n = write(in->wfd, buf, total);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            in->overflow = 1;              /* 队列满，稍后报 IN_Q_OVERFLOW */
+        } else if (errno == EPIPE || errno == ECONNRESET) {
+            in->stop = 1;                  /* 读端已关闭，实例作废 */
+        }
+    }
+    DBG("emit wd=%d mask=0x%x name=%s\n", wd, e->mask, name ? name : "");
+}
+
+static void emit_overflow(struct inst *in)
+{
+    int i;
+    for (i = 0; i < MAX_WATCH; i++) {
+        if (in->w[i].used) {
+            emit(in, in->w[i].wd, IN_Q_OVERFLOW, 0, NULL, 0);
+        }
+    }
+    in->overflow = 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * 目录扫描与快照比对
+ * ------------------------------------------------------------------------ */
+static int cmpent(const void *a, const void *b)
+{
+    return strcmp(((const struct entry *)a)->name,
+                  ((const struct entry *)b)->name);
+}
+
+static int scan_dir(const char *path, struct entry **out)
+{
+    DIR *d;
+    struct dirent *de;
+    struct entry *e;
+    int n = 0, cap = 32;
+
+    *out = NULL;
+    d = opendir(path);
+    if (!d) return -1;
+
+    e = (struct entry *)calloc((size_t)cap, sizeof(*e));
+    if (!e) { closedir(d); return -1; }
+
+    while ((de = readdir(d)) != NULL) {
+        char full[PATH_MAX + NAME_MAX + 2];
+        struct stat st;
+        struct entry *t;
+
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (n == cap) {
+            struct entry *ne;
+            cap *= 2;
+            ne = (struct entry *)realloc(e, (size_t)cap * sizeof(*e));
+            if (!ne) { free(e); closedir(d); return -1; }
+            e = ne;
+        }
+        t = &e[n];
+        memset(t, 0, sizeof(*t));
+        strncpy(t->name, de->d_name, NAME_MAX);
+        t->name[NAME_MAX] = '\0';
+
+        snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
+        if (lstat(full, &st) == 0) {
+            t->isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+            t->size  = (long)st.st_size;
+            t->mtime = st.st_mtime;
+        }
+        n++;
+    }
+    closedir(d);
+    qsort(e, (size_t)n, sizeof(*e), cmpent);
+    *out = e;
+    return n;
+}
+
+/* 释放文件级关联 */
+static void free_files(struct inst *in, struct watch *w)
+{
+    int j;
+    for (j = 0; j < w->nffo; j++) {
+        port_dissociate(in->port, PORT_SOURCE_FILE, (uintptr_t)&w->ffo[j]);
+        free(w->fname[j]);
+        free(w->fbase[j]);
+    }
+    free(w->ffo);   w->ffo = NULL;
+    free(w->fname); w->fname = NULL;
+    free(w->fbase); w->fbase = NULL;
+    w->nffo = 0;
+}
+
+/* 对目录内普通文件做 port_associate，用于感知内容修改 */
+static void assoc_files(struct inst *in, struct watch *w,
+                        struct entry *ents, int nents)
+{
+    int i, k = 0, cap;
+
+    free_files(in, w);
+    if (!ents || nents <= 0) return;
+
+    cap = nents < MAX_FILES ? nents : MAX_FILES;
+    w->ffo   = (struct file_obj *)calloc((size_t)cap, sizeof(struct file_obj));
+    w->fname = (char **)calloc((size_t)cap, sizeof(char *));
+    w->fbase = (char **)calloc((size_t)cap, sizeof(char *));
+    if (!w->ffo || !w->fname || !w->fbase) {
+        free_files(in, w);
+        return;
+    }
+
+    for (i = 0; i < nents && k < cap; i++) {
+        char full[PATH_MAX + NAME_MAX + 2];
+        struct stat st;
+
+        if (ents[i].isdir) continue;
+        snprintf(full, sizeof(full), "%s/%s", w->path, ents[i].name);
+        if (stat(full, &st) != 0) continue;
+
+        w->fname[k] = strdup(full);
+        w->fbase[k] = strdup(ents[i].name);
+        if (!w->fname[k] || !w->fbase[k]) {
+            free(w->fname[k]); w->fname[k] = NULL;
+            free(w->fbase[k]); w->fbase[k] = NULL;
+            break;
+        }
+        w->ffo[k].fo_atime = st.st_atim;
+        w->ffo[k].fo_mtime = st.st_mtim;
+        w->ffo[k].fo_ctime = st.st_ctim;
+        w->ffo[k].fo_name  = w->fname[k];
+
+        if (port_associate(in->port, PORT_SOURCE_FILE,
+                           (uintptr_t)&w->ffo[k], FILE_MODIFIED, NULL) == 0) {
+            k++;
+        } else {
+            free(w->fname[k]); w->fname[k] = NULL;
+            free(w->fbase[k]); w->fbase[k] = NULL;
+        }
+    }
+    w->nffo = k;
+    DBG("assoc_files %s: %d 个文件\n", w->path, k);
+}
+
+/* 关联目录本身，拿 name 级变化 */
+static int assoc_dir(struct inst *in, struct watch *w)
+{
+    struct stat st;
+
+    if (stat(w->path, &st) != 0) return -1;
+    if (!w->fo_name) {
+        w->fo_name = strdup(w->path);
+        if (!w->fo_name) return -1;
+    }
+    w->fo.fo_atime = st.st_atim;
+    w->fo.fo_mtime = st.st_mtim;
+    w->fo.fo_ctime = st.st_ctim;
+    w->fo.fo_name  = w->fo_name;
+
+    /*
+     * 只能传可过滤的位（FILE_ACCESS / FILE_MODIFIED / FILE_ATTRIB / FILE_TRUNC）。
+     * FILE_DELETE / FILE_RENAME_TO / FILE_RENAME_FROM / UNMOUNTED / MOUNTEDOVER
+     * 是**异常事件**，port_associate 手册明确说 "cannot be filtered" ——
+     * 把它们 OR 进 events 会直接 EINVAL（实测 errno=22）。
+     * 不传也会在发生时自动投递，所以目录的增/删/改名靠 mtime 变化
+     * （FILE_MODIFIED）触发，再由快照比对还原。
+     */
+    {
+        int r = port_associate(in->port, PORT_SOURCE_FILE, (uintptr_t)&w->fo,
+                               FILE_MODIFIED | FILE_ATTRIB, NULL);
+        DBG("assoc_dir %s -> %d%s%s\n", w->path, r,
+            r ? " errno=" : "", r ? strerror(errno) : "");
+        return r;
+    }
+}
+
+/* 目录快照比对 → 生成 CREATE/DELETE/MOVED/MODIFY 事件 */
+static void diff_dir(struct inst *in, struct watch *w)
+{
+    struct entry *neu = NULL;
+    int nn, i, j, *uo = NULL, *un = NULL;
+    uint32_t cookie = (uint32_t)(EVENT_COOKIE + w->wd);
+
+    nn = scan_dir(w->path, &neu);
+    if (nn < 0) return;
+
+    uo = (int *)calloc((size_t)(w->nents > 0 ? w->nents : 1), sizeof(int));
+    un = (int *)calloc((size_t)(nn > 0 ? nn : 1), sizeof(int));
+    if (!uo || !un) { free(uo); free(un); free(neu); return; }
+
+    /* 1) 同名条目：比对内容修改 */
+    for (i = 0; i < w->nents; i++) {
+        for (j = 0; j < nn; j++) {
+            if (uo[i] || un[j]) continue;
+            if (strcmp(w->ents[i].name, neu[j].name)) continue;
+            uo[i] = un[j] = 1;
+            if (!neu[j].isdir &&
+                (neu[j].size != w->ents[i].size ||
+                 neu[j].mtime != w->ents[i].mtime)) {
+                emit(in, w->wd, IN_MODIFY, 0, neu[j].name, 0);
+            }
+            break;
+        }
+    }
+
+    /* 2) 消失的 / 新增的 —— 先尝试配对成 rename */
+    for (i = 0; i < w->nents; i++) {
+        if (uo[i]) continue;
+        for (j = 0; j < nn; j++) {
+            if (un[j]) continue;
+            if (w->ents[i].isdir != neu[j].isdir) continue;
+            /* 文件：大小与 mtime 都一致才认定为同一次 rename */
+            if (!w->ents[i].isdir &&
+                (w->ents[i].size != neu[j].size ||
+                 w->ents[i].mtime != neu[j].mtime)) continue;
+            uo[i] = un[j] = 1;
+            emit(in, w->wd, IN_MOVED_FROM, cookie, w->ents[i].name,
+                 w->ents[i].isdir);
+            emit(in, w->wd, IN_MOVED_TO,   cookie, neu[j].name, neu[j].isdir);
+            break;
+        }
+    }
+
+    /* 3) 剩下的消失项 = 删除 */
+    for (i = 0; i < w->nents; i++) {
+        if (uo[i]) continue;
+        uo[i] = 1;
+        emit(in, w->wd, IN_DELETE, 0, w->ents[i].name, w->ents[i].isdir);
+    }
+
+    /* 4) 剩下的新增项 = 创建 */
+    for (j = 0; j < nn; j++) {
+        if (un[j]) continue;
+        un[j] = 1;
+        emit(in, w->wd, IN_CREATE, 0, neu[j].name, neu[j].isdir);
+    }
+
+    free(uo);
+    free(un);
+
+    /* 更新快照 */
+    free(w->ents);
+    w->ents  = neu;
+    w->nents = nn;
+
+    /* 文件级关联需要跟着目录内容变化重建 */
+    assoc_files(in, w, w->ents, w->nents);
+}
+
+/* ---------------------------------------------------------------------------
+ * 事件分发
+ * ------------------------------------------------------------------------ */
+static void handle_object(struct inst *in, void *obj)
+{
+    int i, j;
+
+    for (i = 0; i < MAX_WATCH; i++) {
+        struct watch *w = &in->w[i];
+        if (!w->used) continue;
+
+        if (w->isdir && obj == (void *)&w->fo) {
+            DBG("目录事件: %s\n", w->path);
+            diff_dir(in, w);
+            assoc_dir(in, w);          /* 取走后关联已解除，必须重新关联 */
+            return;
+        }
+
+        for (j = 0; j < w->nffo; j++) {
+            struct stat st;
+
+            if (obj != (void *)&w->ffo[j]) continue;
+
+            if (w->isdir) {
+                emit(in, w->wd, IN_MODIFY, 0, w->fbase[j], 0);
+            } else {
+                emit(in, w->wd, IN_MODIFY, 0, NULL, 0);
+            }
+
+            if (stat(w->fname[j], &st) == 0) {
+                w->ffo[j].fo_atime = st.st_atim;
+                w->ffo[j].fo_mtime = st.st_mtim;
+                w->ffo[j].fo_ctime = st.st_ctim;
+                port_associate(in->port, PORT_SOURCE_FILE,
+                               (uintptr_t)&w->ffo[j], FILE_MODIFIED, NULL);
+
+                /*
+                 * 关键：同步目录快照里这个文件的 size/mtime。
+                 * 目录快照只在"目录级事件"时重建，而内容修改只触发文件级事件；
+                 * 不同步的话，随后的 rename 会因为 size/mtime 对不上而
+                 * 退化成 DELETE + CREATE（丢失 Renamed 语义）。
+                 */
+                if (w->isdir) {
+                    int k;
+                    for (k = 0; k < w->nents; k++) {
+                        if (!strcmp(w->ents[k].name, w->fbase[j])) {
+                            w->ents[k].size  = (long)st.st_size;
+                            w->ents[k].mtime = st.st_mtime;
+                            break;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+    DBG("未知对象 %p\n", obj);
+}
+
+static void *worker(void *arg)
+{
+    struct inst *in = (struct inst *)arg;
+    sigset_t set;
+    int bad = 0;
+
+    /* 关键：屏蔽 SIGPIPE。读端被 .NET 关闭后 send() 会返回 EPIPE 而不是杀进程 */
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    for (;;) {
+        port_event_t pe;
+        timespec_t   ts;
+        int r, e, stop;
+
+        ts.tv_sec  = 0;
+        ts.tv_nsec = 200 * 1000 * 1000;      /* 200ms，用于定期检查 stop */
+
+        errno = 0;
+        r = port_get(in->port, &pe, &ts);
+        e = errno;
+
+        if (r != 0) {
+            /*
+             * 注意 illumos 的 port_get 在超时时返回 -1 **且不设置 errno**
+             * （实测 errno 保持 0）。所以必须把 errno==0 也当成"无事件"，
+             * 否则连续超时会被误判为故障，worker 空闲一段时间后自己退出。
+             */
+            if (e == 0 || e == ETIME || e == EINTR) {
+                stop = 0;
+                pthread_mutex_lock(&in->lock);
+                stop = in->stop;
+                pthread_mutex_unlock(&in->lock);
+                if (stop) break;
+                continue;
+            }
+            /*
+             * 真正的错误也不要立刻终止 —— 否则一次偶发失败会让整个
+             * watcher 永久静默。累计到一定次数才放弃。
+             */
+            DBG("port_get r=%d errno=%d (%s)\n", r, e, strerror(e));
+            if (++bad > 50) break;
+            usleep(10000);
+            continue;
+        }
+        bad = 0;
+
+        pthread_mutex_lock(&in->lock);
+        if (in->stop) { pthread_mutex_unlock(&in->lock); break; }
+
+        if (pe.portev_source == PORT_SOURCE_FILE) {
+            handle_object(in, (void *)pe.portev_object);
+        }
+        if (in->overflow) emit_overflow(in);
+        pthread_mutex_unlock(&in->lock);
+    }
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * 对外 API
+ * ------------------------------------------------------------------------ */
+int inotify_init1(int flags)
+{
+    struct inst *in;
+    int sv[2];
+    int fl;
+
+    (void)flags;
+
+    in = (struct inst *)calloc(1, sizeof(*in));
+    if (!in) { errno = ENOMEM; return -1; }
+
+    in->port = port_create();
+    if (in->port < 0) { free(in); return -1; }
+
+    /* 用 socketpair 而不是 pipe：send(MSG_NOSIGNAL) 可彻底避免 SIGPIPE */
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        close(in->port); free(in); return -1;
+    }
+    in->rfd = sv[0];
+    in->wfd = sv[1];
+
+    fl = fcntl(in->wfd, F_GETFL, 0);
+    fcntl(in->wfd, F_SETFL, fl | O_NONBLOCK);
+    fcntl(in->rfd, F_SETFD, FD_CLOEXEC);
+    fcntl(in->wfd, F_SETFD, FD_CLOEXEC);
+
+    pthread_mutex_init(&in->lock, NULL);
+    in->nextwd = 1;
+
+    if (pthread_create(&in->tid, NULL, worker, in) != 0) {
+        close(in->port); close(in->rfd); close(in->wfd);
+        pthread_mutex_destroy(&in->lock);
+        free(in);
+        errno = EAGAIN;
+        return -1;
+    }
+
+    inst_register(in);
+    DBG("inotify_init1 -> fd=%d port=%d\n", in->rfd, in->port);
+    return in->rfd;
+}
+
+int inotify_add_watch(int fd, const char *path, uint32_t mask)
+{
+    struct inst *in = inst_of(fd);
+    struct stat st;
+    int i, slot = -1, wd;
+    struct watch *w;
+
+    (void)mask;
+    if (!in) { errno = EBADF; return -1; }
+    if (!path || stat(path, &st) != 0) return -1;
+
+    pthread_mutex_lock(&in->lock);
+
+    /* 同一路径重复添加：返回原 wd（与 Linux 行为一致） */
+    for (i = 0; i < MAX_WATCH; i++) {
+        if (in->w[i].used && !strcmp(in->w[i].path, path)) {
+            wd = in->w[i].wd;
+            pthread_mutex_unlock(&in->lock);
+            return wd;
+        }
+        if (!in->w[i].used && slot < 0) slot = i;
+    }
+    if (slot < 0) { pthread_mutex_unlock(&in->lock); errno = ENOSPC; return -1; }
+
+    w = &in->w[slot];
+    memset(w, 0, sizeof(*w));
+    w->used  = 1;
+    w->wd    = in->nextwd++;
+    w->isdir = S_ISDIR(st.st_mode) ? 1 : 0;
+    strncpy(w->path, path, PATH_MAX - 1);
+
+    if (w->isdir) {
+        if (assoc_dir(in, w) != 0) goto fail;
+        w->nents = scan_dir(w->path, &w->ents);
+        if (w->nents < 0) { w->nents = 0; w->ents = NULL; }
+        assoc_files(in, w, w->ents, w->nents);
+    } else {
+        /* 单文件监视：Linux 语义下事件不带 name */
+        char *full = strdup(path);
+
+        if (!full) goto fail;
+        w->ffo   = (struct file_obj *)calloc(1, sizeof(struct file_obj));
+        w->fname = (char **)calloc(1, sizeof(char *));
+        w->fbase = (char **)calloc(1, sizeof(char *));
+        if (!w->ffo || !w->fname || !w->fbase) { free(full); goto fail; }
+        w->fname[0] = full;                 /* 交给 fail 路径统一释放 */
+        w->fbase[0] = strdup(path);
+        if (!w->fbase[0]) goto fail;
+        w->ffo[0].fo_atime = st.st_atim;
+        w->ffo[0].fo_mtime = st.st_mtim;
+        w->ffo[0].fo_ctime = st.st_ctim;
+        w->ffo[0].fo_name  = full;
+        if (port_associate(in->port, PORT_SOURCE_FILE, (uintptr_t)&w->ffo[0],
+                           FILE_MODIFIED | FILE_ATTRIB, NULL) != 0) {
+            goto fail;
+        }
+        w->nffo = 1;
+    }
+
+    wd = w->wd;
+    pthread_mutex_unlock(&in->lock);
+    DBG("add_watch %s -> wd=%d (%s)\n", path, wd, w->isdir ? "dir" : "file");
+    return wd;
+
+fail:
+    {
+        /* 保留真实失败原因，别被清理动作掩盖 */
+        int saved = errno;
+
+        if (w->isdir) {
+            port_dissociate(in->port, PORT_SOURCE_FILE, (uintptr_t)&w->fo);
+        }
+        free_files(in, w);
+        free(w->ents);
+        free(w->fo_name);
+        memset(w, 0, sizeof(*w));
+        pthread_mutex_unlock(&in->lock);
+        errno = saved ? saved : EINVAL;
+        DBG("add_watch %s 失败: %s\n", path, strerror(errno));
+        return -1;
+    }
+}
+
+int inotify_rm_watch(int fd, int wd)
+{
+    struct inst *in = inst_of(fd);
+    int i;
+
+    if (!in) { errno = EBADF; return -1; }
+
+    pthread_mutex_lock(&in->lock);
+    for (i = 0; i < MAX_WATCH; i++) {
+        struct watch *w = &in->w[i];
+        if (!w->used || w->wd != wd) continue;
+
+        if (w->isdir) {
+            port_dissociate(in->port, PORT_SOURCE_FILE, (uintptr_t)&w->fo);
+        }
+        free_files(in, w);
+        free(w->ents);   w->ents = NULL;
+        free(w->fo_name); w->fo_name = NULL;
+        w->used = 0;
+
+        /* Linux 在 rm_watch 后会投递 IN_IGNORED */
+        emit(in, wd, IN_IGNORED, 0, NULL, 0);
+        pthread_mutex_unlock(&in->lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&in->lock);
+    errno = EINVAL;
+    return -1;
+}
+ILLUMOS_INOTIFY_C_EOF
+
+    cat > "$FSW_DIR/pal_shim.c" <<'PAL_SHIM_C_EOF'
+/*
+ * pal_shim.c — .NET PAL 垫片：把 libSystem.Native 里被编成 ENOTSUP 桩的
+ *              FileSystemWatcher 原生入口重定向到用户态 inotify
+ * =============================================================================
+ *
+ * 原理
+ * ----
+ * .NET 的 P/Invoke 解析流程是：
+ *       dlopen("libSystem.Native.so")  →  dlsym(handle, "SystemNative_INotifyInit")
+ * 而 dlsym(handle, sym) 会沿该 handle 的 **DT_NEEDED 依赖链**继续查找。
+ *
+ * 所以只要造一个同名的 libSystem.Native.so（本文件），它：
+ *   1) 自己定义那 3 个 inotify 符号          → 覆盖掉原库里的 ENOTSUP 桩
+ *   2) DT_NEEDED 指向改名的原库 libSNative.so → 其余 200+ 符号沿依赖链透传
+ * 就能在不重建 SDK 的前提下换掉这段实现。
+ *
+ * 前提（install 脚本负责）
+ * ------------------------
+ *   - 原 libSystem.Native.so 复制为 libSNative.so 并把 SONAME 改成 libSNative.so
+ *     （不改 SONAME 的话 ld 会报 "recording name conflict" 直接拒绝链接）
+ *   - 本垫片的 SONAME 保持 libSystem.Native.so，DT_RUNPATH 用 $ORIGIN，
+ *     保证同一目录下能找到 libSNative.so
+ *
+ * 编译
+ * ----
+ *   gcc -O2 -shared -fPIC -o libSystem.Native.so pal_shim.c \
+ *       ./libSNative.so \
+ *       -Wl,-soname,libSystem.Native.so \
+ *       -Wl,-z,origin -Wl,-rpath,'$ORIGIN' \
+ *       ./libillumos_inotify.so
+ */
+
+#include <stdint.h>
+
+/* 用户态 inotify 实现（libillumos_inotify.so） */
+extern int inotify_init1(int flags);
+extern int inotify_add_watch(int fd, const char *path, uint32_t mask);
+extern int inotify_rm_watch(int fd, int wd);
+
+/* 与 dotnet/runtime 的 pal_io.h 保持一致 */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0x80000
+#endif
+
+intptr_t SystemNative_INotifyInit(void)
+{
+    return (intptr_t)inotify_init1(O_CLOEXEC);
+}
+
+int32_t SystemNative_INotifyAddWatch(intptr_t fd, const char *pathName, uint32_t mask)
+{
+    if (fd < 0 || pathName == 0) return -1;
+    return (int32_t)inotify_add_watch((int)fd, pathName, mask);
+}
+
+int32_t SystemNative_INotifyRemoveWatch(intptr_t fd, int32_t wd)
+{
+    if (fd < 0) return -1;
+    return (int32_t)inotify_rm_watch((int)fd, (int)wd);
+}
+PAL_SHIM_C_EOF
+
+    cat > "$FSW_DIR/fsw_selftest.c" <<'FSW_SELFTEST_C_EOF'
+/*
+ * fsw_selftest.c — 垫片安装后的 C 层自检
+ *   dlopen 垫片 -> dlsym 三个覆盖符号 + 一个透传符号 -> 实调 -> 校验
+ * 不依赖 .NET 工具链，避免把 SDK 自身的问题误判成垫片故障。
+ */
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdint.h>
+
+int main(int argc, char **argv)
+{
+    void *h;
+    long (*init1)(void);
+    void *(*m)(unsigned long);
+    long fd;
+
+    if (argc < 2) { printf("SELFTEST FAIL 用法: fsw_selftest <垫片路径>\n"); return 2; }
+
+    h = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { printf("SELFTEST FAIL dlopen: %s\n", dlerror()); return 1; }
+
+    /* 1) 覆盖符号必须在垫片里 */
+    init1 = (long (*)(void))dlsym(h, "SystemNative_INotifyInit");
+    if (!init1) { printf("SELFTEST FAIL 找不到 SystemNative_INotifyInit\n"); return 1; }
+
+    fd = init1();
+    if (fd < 0) { printf("SELFTEST FAIL InotifyInit 返回 %ld\n", fd); return 1; }
+
+    /* 2) 透传符号必须经依赖链从原库解析到 */
+    m = (void *(*)(unsigned long))dlsym(h, "SystemNative_Malloc");
+    if (!m || !m(32)) { printf("SELFTEST FAIL 透传符号 SystemNative_Malloc 异常\n"); return 1; }
+
+    /* 3) 继续验证 add_watch 真的能挂上（说明 portfs 可用） */
+    {
+        int (*addw)(long, const char *, unsigned int);
+        addw = (int (*)(long, const char *, unsigned int))dlsym(h, "SystemNative_INotifyAddWatch");
+        if (!addw) { printf("SELFTEST FAIL 找不到 SystemNative_INotifyAddWatch\n"); return 1; }
+    }
+
+    printf("SELFTEST OK fd=%ld\n", fd);
+    return 0;
+}
+FSW_SELFTEST_C_EOF
+
+    # --- 3.5a) 编译用户态 inotify ---
+    # illumos 的 socketpair 在 libsocket 里，不显式链接会 undefined symbol
+    if gcc -O2 -shared -fPIC -o "$FSW_DIR/libillumos_inotify.so"            "$FSW_DIR/illumos_inotify.c"            -lpthread -lsocket -lnsl -Wl,-soname,libillumos_inotify.so            >"$FSW_DIR/build.log" 2>&1; then
+      c_ok "  libillumos_inotify.so 编译成功（$(stat -c%s "$FSW_DIR/libillumos_inotify.so") 字节）"
+
+      if gcc -O2 -o "$FSW_DIR/fsw_selftest" "$FSW_DIR/fsw_selftest.c"              -lsocket -lnsl >"$FSW_DIR/selftest-build.log" 2>&1; then
+
+        FSW_OK=0
+        FSW_SKIP=0
+
+        # 每个共享框架目录都处理（通常只有 Microsoft.NETCore.App 一个）
+        for FD in "$PREFIX"/shared/*/*/libSystem.Native.so; do
+          [ -f "$FD" ] || { FSW_SKIP=1; continue; }
+
+          FDIR="$(dirname "$FD")"
+          REAL="$FDIR/libSNative.so"
+          INOT="$FDIR/libillumos_inotify.so"
+          TAG="$(basename "$FDIR")"
+          ORIG="$ORIG_STORE/$TAG.libSystem.Native.so"
+
+          # 首次安装：先把原始库留一份永久备份
+          if [ ! -s "$ORIG" ] && [ ! -s "$REAL" ]; then
+            cp -p "$FD" "$ORIG"
+            c_info "  原始库已备份到 $ORIG"
+          fi
+
+          # 幂等：已装过就先清干净，重新构建
+          if [ -s "$REAL" ]; then
+            c_info "  检测到既有垫片，先还原再重建"
+            [ -s "$ORIG" ] && cp -f "$ORIG" "$FD" || cp -f "$REAL" "$FD"
+            rm -f "$REAL" "$INOT"
+          fi
+
+          # 复制出真库并改 SONAME（必须等长或更短）
+          cp -f "$FD" "$REAL"
+          if "$PY" - "$REAL" <<'SONAME_PY_EOF'
+import sys
+p = sys.argv[1]
+d = bytearray(open(p, "rb").read())
+old = b"libSystem.Native.so\x00"
+new = b"libSNative.so\x00"
+i = d.find(old)
+if i < 0:
+    print("SONAME 已是 libSNative.so，跳过")
+else:
+    d[i:i + len(old)] = new + b"\x00" * (len(old) - len(new))
+    open(p, "wb").write(bytes(d))
+    print("SONAME 已改写为 libSNative.so")
+SONAME_PY_EOF
+          then :; else c_warn "  改 SONAME 失败"; fi
+
+          # 编垫片：SONAME 保持原名，DT_NEEDED 指向真库，$ORIGIN 定位同目录
+          if gcc -O2 -shared -fPIC -o "$FD" "$FSW_DIR/pal_shim.c" "$REAL"                  -L"$FSW_DIR" -lillumos_inotify                  -Wl,-soname,libSystem.Native.so                  -Wl,-z,origin -Wl,-rpath,'$ORIGIN'                  >>"$FSW_DIR/build.log" 2>&1; then
+            cp -f "$FSW_DIR/libillumos_inotify.so" "$INOT"
+
+            if OUT="$("$FSW_DIR/fsw_selftest" "$FD" 2>&1)" &&                printf '%s' "$OUT" | grep -q "SELFTEST OK"; then
+              c_ok "  垫片就位并自检通过（$TAG）"
+              FSW_OK=1
+            else
+              c_warn "  垫片自检失败，回滚：$OUT"
+              [ -s "$ORIG" ] && cp -f "$ORIG" "$FD" || true
+              rm -f "$REAL" "$INOT"
+            fi
+          else
+            c_warn "  垫片编译失败，回滚"
+            sed 's/^/    /' "$FSW_DIR/build.log" | tail -n 5 >&2 || true
+            [ -s "$ORIG" ] && cp -f "$ORIG" "$FD" || true
+            rm -f "$REAL" "$INOT"
+          fi
+        done
+
+        [ "$FSW_SKIP" = "1" ] && c_warn "  没找到 libSystem.Native.so，跳过"
+        if [ "$FSW_OK" = "1" ]; then
+          c_ok "FileSystemWatcher 已可用（portfs 后端，非轮询）"
+        fi
+      else
+        c_warn "  自检程序编译失败，跳过垫片安装"
+        sed 's/^/    /' "$FSW_DIR/selftest-build.log" | tail -n 5 >&2 || true
+      fi
+    else
+      c_warn "  libillumos_inotify.so 编译失败，跳过垫片安装"
+      sed 's/^/    /' "$FSW_DIR/build.log" | tail -n 10 >&2 || true
+    fi
+    rm -rf "$FSW_DIR"
   fi
 fi
 
