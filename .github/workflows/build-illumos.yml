@@ -4,8 +4,8 @@ on:
   # 每天 00:00 UTC（格林尼治时间）自动构建，并发布一个测试版 prerelease。
   # GitHub 的 cron 一律按 UTC 解释，所以 '0 0 * * *' 就是北京时间 08:00。
   # 注意：仓库若连续 60 天无提交活动，GitHub 会自动停用计划任务（需手动重新启用）。
-  schedule:
-    - cron: '0 0 * * *'
+ # schedule:
+  #  - cron: '0 0 * * *'
   workflow_dispatch:
     inputs:
       fork:
